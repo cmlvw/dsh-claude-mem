@@ -1,0 +1,6 @@
+{
+  "guide": "Memory (dsh-claude-mem): memories live across sessions. What is injected is an index only (each line <= 60 chars); call mem_read for the body.\n· Record: user preferences and red lines, project decisions and their reasons, gotchas and corrections, and how a thing unfolded (topic).\n· Do not record: paths/ports/versions that code or config already answers; secrets and credentials (rejected); one-off process chatter.\n· When: the user says \"last time / we agreed\", or a design tradeoff for this project comes up — read the index first, then mem_read. If nothing hits, do not pad.",
+  "injectHeader": "Long-term memory",
+  "indexMore": "and {n} more: mem_project({project})",
+  "staleHint": "point-in-time observation, not live; verify before asserting"
+}

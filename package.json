@@ -1,0 +1,45 @@
+{
+  "name": "dsh-claude-mem",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-project memory for DeepSeek Harness: index-only injection, selective recall, two-tier (global + workspace) SQLite storage. Zero third-party runtime deps.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "agent-memory"
+  ],
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "load-check": "node tools/load-check.mjs",
+    "mutex-check": "node tools/check-default-disabled.mjs",
+    "rehearsal": "node tools/rehearsal/run-rehearsal.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  }
+}

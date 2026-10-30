@@ -1,0 +1,4 @@
+﻿- id: meow-memory
+  disabled: false
+- id: dsh-claude-mem
+  disabled: false

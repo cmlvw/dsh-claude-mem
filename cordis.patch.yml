@@ -1,0 +1,9 @@
+# dsh-claude-mem bundle patch: inserts this plugin into a profile's layer stack.
+# Rows reference the package by name so Node resolution finds the installed code.
+#
+# 安装后默认 disabled（PLAN.md §13-C）：启用是用户的动作，不是安装的副作用。
+# 手工安装时若 profile 的 patch 已列出本包，确保 row 上带 disabled: true。
+- insert:
+    - id: dsh-claude-mem
+      name: 'dsh-claude-mem'
+      disabled: true

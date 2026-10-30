@@ -1,0 +1,6 @@
+# 演练阶段补丁：显式控制两家的启停。
+# 用法：--patch 这个文件叠加在 profile 层之后
+- id: meow-memory
+  disabled: true
+- id: dsh-claude-mem
+  disabled: false

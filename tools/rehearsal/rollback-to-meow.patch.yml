@@ -1,0 +1,5 @@
+# 演练阶段补丁：回滚姿势 —— 本插件关掉，meow 恢复启用。
+- id: meow-memory
+  disabled: false
+- id: dsh-claude-mem
+  disabled: true

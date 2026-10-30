@@ -1,0 +1,22 @@
+# 演练用覆盖层：只给隔离 profile 用，不进现网 desktop。
+# 挂 mock 模型 + 把全局库隔离到演练目录（不碰真实的 D:\dsh-claude-mem）。
+- id: agent-default-model
+  config:
+    provider: rehearsal
+    model: rehearsal-mock
+
+- id: llm-pi-ai
+  config:
+    providers:
+      rehearsal:
+        displayName: 演练假模型
+        api: openai-completions
+        baseURL: http://127.0.0.1:18777/v1
+        models:
+          - id: rehearsal-mock
+        apiKeyEnv: REHEARSAL_API_KEY
+
+- id: dsh-claude-mem
+  config:
+    # 全局库挪到演练目录：断言只针对演练数据，不会被真实记忆污染
+    globalDbPath: C:\Users\User\dsh-claude-mem\.rehearsal\dsh-home\dsh-claude-mem\global.db
