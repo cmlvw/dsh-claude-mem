@@ -12,7 +12,7 @@
  * 纯寒暄（「好的」「继续」）不写，否则观察期就会把表塞满废话。
  */
 import { newEntryId } from './db.js'
-import { scanSecrets } from './secret.js'
+import { scanPii, scanSecrets } from './secret.js'
 
 export const NOTE_KIND = {
   userAsk: 'user-ask',
@@ -49,16 +49,20 @@ export function summarizeForNote(text, maxChars = 200) {
  * 永不 throw。
  * @returns {{written:boolean, id:string|null, reason:string}}
  */
-export function writeNote(db, { sessionId, workspace, kind, body }, now = Date.now()) {
+export function writeNote(db, { sessionId, workspace, kind, body, maxChars = 200 }, now = Date.now()) {
   const skipped = (reason) => ({ written: false, id: null, reason })
   try {
     if (db === null || db === undefined) return skipped('no-db')
     if (typeof sessionId !== 'string' || sessionId === '') return skipped('no-session')
     if (typeof kind !== 'string' || kind === '') return skipped('no-kind')
-    const text = summarizeForNote(body)
-    if (text === '') return skipped('empty')
-    const scan = scanSecrets(text)
+    // 先扫完整原文再截断：密钥正好跨在截断点上时，只扫片段会漏掉，半截密钥就进库了。
+    const scan = scanSecrets(body)
     if (scan.hit) return skipped(`secret:${scan.rules.join('+')}`)
+    // 笔记是用户原话，手机号和身份证同样不留。
+    const pii = scanPii(body)
+    if (pii.hit) return skipped(`pii:${pii.rules.join('+')}`)
+    const text = summarizeForNote(body, maxChars)
+    if (text === '') return skipped('empty')
 
     const id = newEntryId()
     db.prepare(
@@ -67,6 +71,17 @@ export function writeNote(db, { sessionId, workspace, kind, body }, now = Date.n
     return { written: true, id, reason: 'ok' }
   } catch {
     return skipped('error')
+  }
+}
+
+/** 最近的笔记，供 mem_review 整理时参考。 */
+export function listRecentNotes(db, { since = 0, limit = 20 } = {}) {
+  try {
+    return db
+      .prepare(`SELECT id, session_id, kind, body, at FROM session_notes WHERE at >= ? ORDER BY at DESC LIMIT ?`)
+      .all(since, limit)
+  } catch {
+    return []
   }
 }
 

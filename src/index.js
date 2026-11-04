@@ -3,26 +3,29 @@
  *
  * 组装顺序（PLAN.md §3/§5）：
  *   1. 全局库（soul/user/rules）—— 打不开也只降级，不 throw；
- *   2. 工作区库按 cwd 懒加载、缓存、随插件卸载关闭；
- *   3. pre-step：首轮核心块 / 后续命中块，插在真实 user 消息**前面**，不改写它；
- *   4. turn-stopping：M5 的 dream 触发点（当前空实现）；
- *   5. systemPrompt.section：恒定记忆手册（缓存友好）。
+ *   2. 工作区库按 cwd 映射到库目录（workspace.js）后懒加载、缓存、随插件卸载关闭；
+ *   3. pre-step：首轮核心块 / 命中块，插在真实 user 消息**前面**，不改写它；
+ *   4. turn-stopping：会话笔记、运行数据清理、dream 门控；
+ *   5. systemPrompt.section：恒定记忆手册（缓存友好）；
+ *   6. 记忆工具与用户命令。
  *
  * 一切注入逻辑都包在 try/catch 里 fail-open；next() 本身异常照常抛给上游，
  * 不把「上游坏了」伪装成「注入成功」。
  */
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 import { Config, resolveConfig } from './config.js'
-import { dbStats, openMemoryDb } from './db.js'
+import { dbStats, openMemoryDb, readMeta, writeMeta } from './db.js'
 import { collectCore, estimateTokens, renderHitBlock } from './inject.js'
-import { assembleHits, buildGateTerms, detectProject, matchGateTerms, recall, shouldRecall } from './recall.js'
-import { rerankHits } from './rerank.js'
+import { buildGateTerms, detectProject } from './recall.js'
+import { embedTexts } from './embed.js'
+import { explainRecall, runRecall } from './pipeline.js'
+import { countMissingVectors, formatLedger, readLedger, recordOutcome } from './ledger.js'
 import { runDreamGate } from './dream.js'
 import { checkMutex, createMutexGuard, describeConflict } from './mutex.js'
-import { NOTE_KIND, shouldNoteUserAsk, summarizeForNote, writeNote } from './notes.js'
+import { NOTE_KIND, shouldNoteUserAsk, writeNote } from './notes.js'
 import {
   buildReinjection,
   classifyCompactionEvent,
@@ -30,17 +33,23 @@ import {
   REINJECT_KIND,
 } from './reinject.js'
 import {
+  bumpInjectCount,
   hasCoreInjection,
   hitInjectionCount,
   injectedIds,
   listProjects,
   markInjected,
   markReinjected,
+  pruneOperationalData,
+  releaseHitInjections,
   shortId,
   touchSession,
 } from './store.js'
 import { createSnapshotMessage } from './message.js'
-import { registerTools } from './tools.js'
+import { hasCoreWriteIntent, registerTools } from './tools.js'
+import { comparablePath } from './workspace.js'
+import { createTrustStore } from './trust.js'
+import { createCommandDefinitions } from './commands.js'
 
 export { Config }
 
@@ -156,7 +165,33 @@ function lastUserTextOf(agent) {
   return ''
 }
 
-/** dream 的推送轮（仅在 dream.mode='push' 时走；默认 observe 不推）。 */
+const REVIEW_INSTRUCTION =
+  '【记忆整理】请调用 mem_review 查看报告，然后：合并重复、补上缺少的原因（why）和使用时机（when_to_use）、作废过时的条目；把笔记里值得长期记住的内容写入记忆，先查重再写入。不确定的不要改。完成后用 mem_review(mark_done=true) 收尾；若没有要处理的，直接回复「无新增」。'
+
+const REVIEW_HINT =
+  '【记忆整理提醒】记忆库已积累了一段时间。不要打断用户当前的任务；等任务告一段落时，可以调用 mem_review 看看有没有要整理的，完成后用 mark_done=true 收尾。'
+
+const UNTRUSTED_NOTICE =
+  '【记忆已暂停】此工作区带有不是本机创建的记忆库，可能来自别人的仓库，在用户确认前不会读取，记忆工具也已暂停。请告诉用户：如果这是自己的项目，执行 /mem-trust 即可恢复。'
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const SESSION_RETENTION_DAYS = 90
+/** 工作区库打开失败后多久可以重试：可能只是暂时被锁，不该一直失效到重启。 */
+const OPEN_RETRY_MS = 60 * 1000
+/** 后台叫醒向量服务时等多久：重新加载模型大约要 5 秒。 */
+const EMBED_WAKE_TIMEOUT_MS = 15 * 1000
+
+/** 数据目录里放一份忽略规则：库里有用户原话，不该被顺手提交进仓库。已有的文件不覆盖。 */
+function ensureIgnoreFile(dataDir) {
+  try {
+    const file = join(dataDir, '.gitignore')
+    if (!existsSync(file)) writeFileSync(file, '*\n', 'utf8')
+  } catch {
+    // 只是防护措施，失败不影响功能
+  }
+}
+
+/** dream 的推送轮（仅在 dream.mode='push' 时走）。 */
 function pushDreamTurn(ctx, agent, cfg) {
   const followup = agent?.followup
   if (typeof followup !== 'function') {
@@ -166,7 +201,7 @@ function pushDreamTurn(ctx, agent, cfg) {
   try {
     followup.call(agent, {
       type: 'text',
-      text: '【记忆整理】本轮请整理本次会话中值得长期记住的内容，按原子记忆 → 话题 → 项目总结三轮推进，先查重再写入，不新增重复条目。若没有值得记住的，直接回复「无新增」。',
+      text: REVIEW_INSTRUCTION,
     })
     return true
   } catch (error) {
@@ -213,6 +248,7 @@ export async function applyPlugin(ctx, rawConfig = {}) {
     enabled: false,
     hooks: [],
     tools: [],
+    commands: [],
     sections: [],
     warnings: [],
     db: null,
@@ -287,23 +323,84 @@ export async function applyPlugin(ctx, rawConfig = {}) {
     }
 
     // 2) 工作区库缓存：一个进程可能同时开多个工作区。
+    //    cwd 先映射到库所在目录；映射结果按 cwd 缓存，不必每轮都探测文件系统。
     const workspaceDbs = new Map()
-    const openWorkspaceDb = (workspace) => {
-      if (typeof workspace !== 'string' || workspace === '') return null
-      const cached = workspaceDbs.get(workspace)
+    const workspaceOpenFailures = new Map()
+    const workspaceRoots = new Map()
+    const trustStore = createTrustStore(join(resolved.dataDir, 'trusted-workspaces'), { preTrusted: resolved.preTrusted })
+    const requireTrust = resolved.config.workspace.requireTrust
+    const rootOf = (cwd) => {
+      const cached = workspaceRoots.get(cwd)
       if (cached !== undefined) return cached
-      const opened = openMemoryDb(resolved.workspaceDbPath(workspace), {
+      const { root, via } = resolved.resolveWorkspace(cwd)
+      workspaceRoots.set(cwd, root)
+      if (via !== 'cwd') {
+        safeLog(ctx, 'info', `${name}: 工作区 ${cwd} 使用 ${root} 的记忆库（${via}）`)
+        appendAudit(ctx, status, 'workspace.resolved', { cwd, root, via })
+      }
+      return root
+    }
+    /** 已有的库（不是刚要新建的）且没有信任标记：不打开，也不读。 */
+    const isUntrusted = (cwd) => {
+      if (!requireTrust || typeof cwd !== 'string' || cwd === '') return false
+      const workspace = rootOf(cwd)
+      if (workspaceDbs.has(comparablePath(workspace))) return false
+      if (!existsSync(resolved.workspaceDbPath(workspace))) return false
+      return !trustStore.isTrusted(workspace)
+    }
+    const openWorkspaceDb = (cwd) => {
+      if (typeof cwd !== 'string' || cwd === '') return null
+      const workspace = rootOf(cwd)
+      const key = comparablePath(workspace)
+      const cached = workspaceDbs.get(key)
+      if (cached !== undefined) return cached
+      const failedAt = workspaceOpenFailures.get(key)
+      if (failedAt !== undefined && Date.now() - failedAt < OPEN_RETRY_MS) return null
+      if (isUntrusted(cwd)) return null
+      const dbPath = resolved.workspaceDbPath(workspace)
+      // 本插件亲手创建的库才自动可信。
+      if (requireTrust && !existsSync(dbPath)) trustStore.trust(workspace, 'created')
+      const opened = openMemoryDb(dbPath, {
         busyTimeoutMs: resolved.config.db.busyTimeoutMs,
         enableFts: resolved.config.db.enableFts,
       })
-      const record = opened.ok ? { db: opened.db, fts: opened.fts, warnings: opened.warnings } : null
-      workspaceDbs.set(workspace, record)
-      if (record === null) status.warnings.push(`工作区库打开失败（${workspace}）：${opened.error}`)
-      else if (opened.warnings.length > 0) status.warnings.push(...opened.warnings)
+      if (!opened.ok) {
+        // 只记第一次，失败后定时重试时不再重复累加 warning。
+        if (failedAt === undefined) status.warnings.push(`工作区库打开失败（${workspace}）：${opened.error}`)
+        workspaceOpenFailures.set(key, Date.now())
+        return null
+      }
+      workspaceOpenFailures.delete(key)
+      ensureIgnoreFile(resolved.workspaceDataDir(workspace))
+      const record = { db: opened.db, fts: opened.fts, warnings: opened.warnings }
+      workspaceDbs.set(key, record)
+      if (opened.warnings.length > 0) status.warnings.push(...opened.warnings)
       return record
     }
 
+    const disposers = []
+    const pendingTimers = new Set()
+    /** 延迟重试：统一登记，卸载时一起取消，避免往已卸载的插件里注册东西。 */
+    const retryLater = (fn) => {
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer)
+        fn()
+      }, 1000)
+      if (typeof timer?.unref === 'function') timer.unref()
+      pendingTimers.add(timer)
+    }
+
     const closeAll = () => {
+      for (const timer of pendingTimers) clearTimeout(timer)
+      pendingTimers.clear()
+      for (const dispose of disposers) {
+        try {
+          dispose()
+        } catch {
+          // 单个清理失败不影响其余
+        }
+      }
+      disposers.length = 0
       for (const record of workspaceDbs.values()) safeClose(record?.db)
       workspaceDbs.clear()
       safeClose(global)
@@ -316,13 +413,24 @@ export async function applyPlugin(ctx, rawConfig = {}) {
     }
     trackDisposal(ctx, status.dispose)
 
+    // 启动自检落盘：向量召回这类「开关改了有没有生效」只有加载期能确认，
+    // 重启后翻 audit.jsonl 一眼就能核对，不必等一次真实召回才有证据。
+    appendAudit(ctx, status, 'startup.recall', {
+      gate: resolved.config.recall.gate.enabled,
+      rerank: resolved.config.recall.rerank.enabled,
+      vector: resolved.config.recall.vector.enabled,
+      vectorUrl: resolved.config.recall.vector.url,
+      vectorModel: resolved.config.recall.vector.model,
+      vectorMinScore: resolved.config.recall.vector.minScore,
+    })
+
     // 3) 会话状态：只放内存，进程退出即清（真正的去重靠 injections 表）。
     const sessionState = new Map()
     const stateOf = (sessionId) => {
       if (sessionState.size > 512) sessionState.clear()
       const found = sessionState.get(sessionId)
       if (found !== undefined) return found
-      const created = { initialDone: false, lastNoteAt: 0 }
+      const created = { initialDone: false, lastNoteAt: 0, quotaNoted: false }
       sessionState.set(sessionId, created)
       return created
     }
@@ -330,8 +438,12 @@ export async function applyPlugin(ctx, rawConfig = {}) {
     // 3b) 压缩重注入待办（M5）：压缩成功后挂起，下一轮 pre-step 取走并插块。
     const reinject = createReinjectScheduler()
 
+    // dream.mode='suggest'：门控打开后，这些会话下一轮附一句整理提醒。
+    const reviewHints = new Set()
+    const untrustedNoticed = new Set()
+
     // 3c) 运行期互斥守卫（M6）：加载后才在 plugin-manager 里热启 meow 的情况。
-    //     每 30s 最多反射一次；命中冲突当轮不注入，并按 10 分钟 cooldown 记日志。
+    //     每轮都反射；命中冲突当轮不注入，并按 10 分钟 cooldown 记日志。
     const mutexGuard = createMutexGuard(ctx, { enabled: resolved.config.mutexWithMeow })
 
     // 门控词表按工作区缓存：关键词变化（M4 写入）最多 60s 后生效，不必每条消息扫库。
@@ -345,6 +457,44 @@ export async function applyPlugin(ctx, rawConfig = {}) {
       gateTermCache.set(workspace, { terms, at: now })
       return terms
     }
+
+    // 向量服务空闲会卸载模型，重新加载要几秒，当前这条消息等不了。
+    // 失败时在后台叫醒一次，下一条消息就能用上；服务真的没开时最多每分钟试一次。
+    let lastWarmAt = 0
+    const wakeEmbedding = () => {
+      const now = Date.now()
+      if (now - lastWarmAt < OPEN_RETRY_MS) return
+      lastWarmAt = now
+      const { url, model } = resolved.config.recall.vector
+      void embedTexts(['warm up'], { url, model, timeoutMs: EMBED_WAKE_TIMEOUT_MS })
+    }
+
+    /** 一轮召回的账本记录。 */
+    const recordRun = (db, run) => {
+      if (run.embedFailed) {
+        recordOutcome(db, 'embed_failed')
+        wakeEmbedding()
+      }
+      if (run.echoes.length > 0) recordOutcome(db, 'echo_dropped', { count: run.echoes.length })
+      if (run.vetoed.length > 0) recordOutcome(db, 'veto_dropped', { count: run.vetoed.length })
+      if (run.outcome.startsWith('skip_')) {
+        recordOutcome(db, run.outcome)
+        return
+      }
+      recordOutcome(db, `open_${run.gate}`)
+      if (run.outcome === 'no_candidates') recordOutcome(db, 'no_candidates')
+    }
+
+    const recallInputFor = (workspace, workspaceDb, sessionId, text) => ({
+      text,
+      globalDb: global,
+      workspaceDb,
+      config: resolved.config,
+      gateTerms: gateTermsOf(workspace, workspaceDb),
+      projectNames: listProjects(workspaceDb, { limit: 20 }).map((row) => row.project),
+      injectedCount: hitInjectionCount(workspaceDb, sessionId),
+      exclude: injectedIds(workspaceDb, sessionId),
+    })
 
     // 4) pre-step 注入。
     registerHook(ctx, status, 'agent/pre-step', async (payload, next) => {
@@ -361,7 +511,7 @@ export async function applyPlugin(ctx, rawConfig = {}) {
         if (header?.origin === 'subagent') return decision
         if (payload?.signal?.aborted === true) return decision
 
-        const userIndex = lastUserIndex(decision.messages)
+        let userIndex = lastUserIndex(decision.messages)
         if (userIndex < 0) return decision
 
         // M6 运行期互斥守卫：加载之后 meow 被热启用了就不再注入（当轮跳过，不抛错）。
@@ -379,20 +529,45 @@ export async function applyPlugin(ctx, rawConfig = {}) {
           return decision
         }
 
+        if (isUntrusted(workspace)) {
+          const root = comparablePath(rootOf(workspace))
+          if (!untrustedNoticed.has(root)) {
+            untrustedNoticed.add(root)
+            decision.messages.splice(
+              userIndex,
+              0,
+              createSnapshotMessage(UNTRUSTED_NOTICE, { injectionKind: 'notice', sections: [{ name: '记忆已暂停', text: UNTRUSTED_NOTICE }] }),
+            )
+            appendAudit(ctx, status, 'workspace.untrusted', { root: rootOf(workspace) })
+          }
+          return decision
+        }
+
         const workspaceDb = openWorkspaceDb(workspace)
         if (workspaceDb === null) return decision
         const state = stateOf(sessionId)
         touchSession(workspaceDb.db, sessionId, workspace)
 
+        if (reviewHints.delete(sessionId)) {
+          decision.messages.splice(
+            userIndex,
+            0,
+            createSnapshotMessage(REVIEW_HINT, { injectionKind: 'review-hint', sections: [{ name: '记忆整理提醒', text: REVIEW_HINT }] }),
+          )
+          userIndex += 1
+        }
+
         const userText = messageText(decision.messages[userIndex])
         const projectNames = listProjects(workspaceDb.db, { limit: 20 }).map((row) => row.project)
         const guessedProject = detectProject(userText, projectNames)
-        const matchedGateTerms = matchGateTerms(userText, gateTermsOf(workspace, workspaceDb.db))
 
         // M5 之 3：压缩后重注入。必须排在「首轮」判断之前——
         // 压缩会让首轮注入记录看起来还「在」，但上下文已经被摘要吃掉了。
         const pending = reinject.take(sessionId)
         if (pending !== null) {
+          // 命中块的正文也被摘要吃掉了：释放记录，让它们能再次命中，配额同时归零。
+          const released = releaseHitInjections(workspaceDb.db, sessionId)
+          state.quotaNoted = false
           const built = buildReinjection(
             { collectCore },
             {
@@ -413,17 +588,20 @@ export async function applyPlugin(ctx, rawConfig = {}) {
                 meta: { reinjectReason: pending.reason },
               }),
             )
-            markReinjected(workspaceDb.db, sessionId, built.ids)
+            markReinjected(workspaceDb.db, sessionId, built.bodyIds)
+            markInjected(workspaceDb.db, sessionId, built.indexIds, 'index')
+            recordOutcome(workspaceDb.db, 'injected_reinject', { chars: built.chars })
             state.initialDone = true
+            userIndex += 1
             safeLog(
               ctx,
               'info',
-              `${name}: 压缩后重注入 ${built.chars} 字（${built.ids.length} 条，原因 ${pending.reason}）`,
+              `${name}: 压缩后重注入 ${built.chars} 字（${built.ids.length} 条，释放命中 ${released} 条，原因 ${pending.reason}）`,
             )
-            return decision
+          } else {
+            safeLog(ctx, 'info', `${name}: 压缩后无可重注入内容（释放命中 ${released} 条）`)
           }
-          safeLog(ctx, 'info', `${name}: 压缩后无可重注入内容，跳过`)
-          return decision
+          // 不提前返回：压缩后的第一条消息同样要走命中召回，否则这一轮什么也想不起来。
         }
 
         const isFirst = !state.initialDone && !hasCoreInjection(workspaceDb.db, sessionId)
@@ -441,64 +619,47 @@ export async function applyPlugin(ctx, rawConfig = {}) {
               0,
               createSnapshotMessage(core.text, { injectionKind: 'initial', sections: [{ name: '长期记忆', text: core.text }] }),
             )
-            markInjected(workspaceDb.db, sessionId, core.ids, 'initial')
+            markInjected(workspaceDb.db, sessionId, core.bodyIds, 'initial')
+            markInjected(workspaceDb.db, sessionId, core.indexIds, 'index')
+            bumpInjectCount([global, workspaceDb.db], core.bodyIds)
+            recordOutcome(workspaceDb.db, 'injected_core', { chars: core.chars })
             state.initialDone = true
+            userIndex += 1
             safeLog(
               ctx,
               'info',
               `${name}: 首轮注入 ${core.chars} 字（≈${estimateTokens(core.chars)} tokens，${core.ids.length} 条，丢 ${core.dropped} 行）`,
             )
           }
-          return decision
+          // 不提前返回：第一条消息往往最需要相关教训，全局 fact/lesson 也只能靠命中才进得来。
         }
 
-        if (
-          !shouldRecall(userText, {
-            enabled: resolved.config.recall.gate.enabled,
-            minChars: resolved.config.recall.gate.minChars,
-            maxHitsPerSession: resolved.config.recall.gate.maxHitsPerSession,
-            injectedCount: hitInjectionCount(workspaceDb.db, sessionId),
-            projectNames,
-            matchedTerms: matchedGateTerms,
-          })
-        ) {
-          return decision
+        // 配额用完后召回会停到下次压缩：留一条记录，否则事后无从判断是「没命中」还是「额度没了」。
+        const hitTurns = hitInjectionCount(workspaceDb.db, sessionId)
+        const hitLimit = resolved.config.recall.gate.maxHitsPerSession
+        if (hitTurns >= hitLimit && !state.quotaNoted) {
+          state.quotaNoted = true
+          safeLog(ctx, 'info', `${name}: 本会话命中配额已用完（${hitTurns}/${hitLimit} 轮），压缩前不再主动召回`)
+          appendAudit(ctx, status, 'recall.quota_exhausted', { sessionId, hitTurns, hitLimit })
         }
 
-        const exclude = injectedIds(workspaceDb.db, sessionId)
-        const stageOne = recall({
-          globalDb: global,
-          workspaceDb: workspaceDb.db,
-          text: userText,
-          topK: resolved.config.recall.topK,
-          exclude,
-          extraTerms: matchedGateTerms,
-        })
-        // Stage 2 默认关（§13-B）：关着时直接返回 Stage 1 顺序，不碰网络。
-        const reranked = await rerankHits(stageOne, {
-          enabled: resolved.config.recall.rerank.enabled,
-          url: resolved.config.recall.rerank.url,
-          timeoutMs: resolved.config.recall.rerank.timeoutMs,
-          maxPicks: resolved.config.recall.rerank.maxPicks,
-          query: userText,
-        })
-        const assembled = assembleHits(reranked.hits, {
-          maxHits: resolved.config.inject.maxHitsPerTurn,
-          maxCharsPerHit: resolved.config.inject.maxHitChars,
-          budget: resolved.config.inject.hitBudget,
-        })
-        if (assembled.picked.length === 0) return decision
-        if (reranked.applied) safeLog(ctx, 'info', `${name}: 精排 ${reranked.reason}（${reranked.hits.length} 条）`)
-        const block = renderHitBlock(assembled.picked)
+        const run = await runRecall(recallInputFor(workspace, workspaceDb.db, sessionId, userText))
+        recordRun(workspaceDb.db, run)
+        // 只留结论，不留用户原话；/mem-why 不带参数时看的就是它。
+        state.lastRun = { ...run, rated: false }
+        if (run.rerank !== null) safeLog(ctx, 'info', `${name}: 精排 ${run.rerank}`)
+        if (run.picked.length === 0) return decision
+        const block = renderHitBlock(run.picked)
         if (block === '') return decision
-        const ids = assembled.picked.map((item) => item.entry.id)
+        const ids = run.picked.map((item) => item.entry.id)
         decision.messages.splice(
           userIndex,
           0,
           createSnapshotMessage(block, { injectionKind: 'hit', sections: [{ name: '记忆命中', text: block }] }),
         )
         markInjected(workspaceDb.db, sessionId, ids, 'hit')
-        state.initialDone = true
+        bumpInjectCount([global, workspaceDb.db], ids)
+        recordOutcome(workspaceDb.db, 'injected_hit', { chars: Array.from(block).length })
         safeLog(
           ctx,
           'info',
@@ -522,12 +683,27 @@ export async function applyPlugin(ctx, rawConfig = {}) {
         if (typeof sessionId !== 'string' || sessionId === '') return
         if (header?.origin === 'subagent') return
         if (typeof workspace !== 'string' || workspace === '') return
+        if (mutexGuard.check().conflict) return
 
         const workspaceDb = openWorkspaceDb(workspace)
         if (workspaceDb === null) return
         const db = workspaceDb.db
 
-        // 5a) 会话笔记（只写不注入，先跑观察）。
+        // 每天最多清理一次运行数据：笔记含用户原话，injections 和 sessions 也会无限增长。
+        const pruneNow = Date.now()
+        if (pruneNow - Number(readMeta(db, 'pruned_at') ?? 0) >= DAY_MS) {
+          writeMeta(db, 'pruned_at', pruneNow)
+          const pruned = pruneOperationalData(
+            db,
+            { notesRetentionDays: resolved.config.notes.retentionDays, sessionRetentionDays: SESSION_RETENTION_DAYS },
+            pruneNow,
+          )
+          if (pruned.notes + pruned.sessions > 0) {
+            safeLog(ctx, 'info', `${name}: 已清理过期笔记 ${pruned.notes} 条、会话 ${pruned.sessions} 个`)
+          }
+        }
+
+        // 5a) 会话笔记（只写不注入，由 mem_review 读取）。
         if (resolved.config.notes.enabled) {
           const state = stateOf(sessionId)
           const now = Date.now()
@@ -541,7 +717,8 @@ export async function applyPlugin(ctx, rawConfig = {}) {
                   sessionId,
                   workspace,
                   kind: NOTE_KIND.userAsk,
-                  body: summarizeForNote(userText, resolved.config.notes.maxChars),
+                  body: userText,
+                  maxChars: resolved.config.notes.maxChars,
                 },
                 now,
               )
@@ -566,6 +743,7 @@ export async function applyPlugin(ctx, rawConfig = {}) {
           `${name}: dream 门控打开（${gate.reason}，会话 ${gate.sessions}，run=${gate.runId}）`,
         )
         if (resolved.config.dream.mode === 'push') pushDreamTurn(ctx, agent, resolved.config)
+        else if (resolved.config.dream.mode === 'suggest') reviewHints.add(sessionId)
       } catch (error) {
         safeLog(ctx, 'warn', `${name}: turn-stopping 处理失败（已忽略）：${error instanceof Error ? error.message : String(error)}`)
       }
@@ -592,15 +770,86 @@ export async function applyPlugin(ctx, rawConfig = {}) {
 
     // 6) 静态记忆手册：恒定文本，缓存友好。
     const prompts = loadPrompts(resolved.config.promptLang)
-    registerGuideSection(ctx, status, prompts)
+    registerGuideSection(ctx, status, prompts, retryLater)
 
-    // 7) 五个记忆工具（M4）。工具不可用时只记 warning，不影响注入。
+    // 7) 记忆工具。工具不可用时只记 warning，不影响注入。
+    const audit = (event, detail) => appendAudit(ctx, status, event, detail)
     registerMemoryTools(ctx, status, {
       config: resolved.config,
       openWorkspaceDb,
       globalDbRef: () => global,
       isGlobalLevel: resolved.isGlobalLevel,
       prompts,
+      isUntrusted,
+      isConflicted: () => mutexGuard.check().conflict,
+      coreWriteAllowed: (exec) => {
+        // 子代理收到的「用户消息」其实来自父代理的模型，不算用户意图。
+        if (exec?.agent?.session?.header?.origin === 'subagent') return false
+        return hasCoreWriteIntent(lastUserTextOf(exec?.agent))
+      },
+      // 宿主的审批服务：缺服务或出错都算「没有审批通道」，由工具层退回关键词判断。
+      requestApproval: async (exec, { toolName, reason }) => {
+        try {
+          const approval = typeof ctx?.get === 'function' ? ctx.get('approval') : undefined
+          if (typeof approval?.request !== 'function' || exec?.agent === undefined) return 'unavailable'
+          return await approval.request({
+            agent: exec.agent,
+            toolName,
+            ...(exec.callId === undefined ? {} : { callId: exec.callId }),
+            reason,
+            ...(exec.signal === undefined ? {} : { signal: exec.signal }),
+          })
+        } catch (error) {
+          safeLog(ctx, 'warn', `${name}: 审批请求失败：${error instanceof Error ? error.message : String(error)}`)
+          return 'unavailable'
+        }
+      },
+      audit,
+      // 无头运行时 logger 没有输出，所以也要落审计：否则工具全部失效都没人知道。
+      onRegisterFailed: (tool, message) => {
+        status.warnings.push(`工具 ${tool} 注册失败：${message}`)
+        safeLog(ctx, 'warn', `${name}: 工具 ${tool} 注册失败：${message}`)
+        audit('tools.register_failed', { tool, message })
+      },
+      onDispose: (dispose) => disposers.push(dispose),
+      retryLater,
+    })
+
+    // 8) 用户命令：信任工作区、批准待确认记忆等必须由用户本人发起的操作。
+    registerUserCommands(ctx, status, {
+      definitions: createCommandDefinitions({
+        globalDb: () => global,
+        workspaceDbFor: (cwd) => openWorkspaceDb(cwd)?.db ?? null,
+        dbsFor: (cwd) => [global, openWorkspaceDb(cwd)?.db ?? null].filter((db) => db !== null),
+        trustWorkspace: (cwd) => {
+          const root = rootOf(cwd)
+          if (trustStore.isTrusted(root)) return { ok: true, root, already: true }
+          return { ok: trustStore.trust(root, 'mem-trust'), root, already: false }
+        },
+        audit,
+        keywordMax: resolved.config.write.keywordMax,
+        lastRun: (sessionId) => sessionState.get(sessionId)?.lastRun ?? null,
+        explain: explainRecall,
+        dryRun: async (cwd, sessionId, text) => {
+          const workspaceDb = openWorkspaceDb(cwd)?.db ?? null
+          if (workspaceDb === null) return null
+          // 试运行回答「这句话能想起什么」，不因本会话注入过就看不到；由说明文字标出来。
+          const input = recallInputFor(cwd, workspaceDb, sessionId ?? '', text)
+          const run = await runRecall({ ...input, exclude: new Set() })
+          run.alreadyInjected = run.picked.filter((item) => input.exclude.has(item.entry.id)).map((item) => item.entry.title)
+          return run
+        },
+        stats: (cwd, days) => {
+          const workspaceDb = openWorkspaceDb(cwd)?.db ?? null
+          return formatLedger(readLedger(workspaceDb, { days }), {
+            vectorEnabled: resolved.config.recall.vector.enabled,
+            missingVectors: countMissingVectors(global) + countMissingVectors(workspaceDb),
+          })
+        },
+        recordFeedback: (cwd, outcome) => recordOutcome(openWorkspaceDb(cwd)?.db ?? null, outcome),
+      }),
+      retryLater,
+      onDispose: (dispose) => disposers.push(dispose),
     })
 
     status.stats = status.db?.stats ?? null
@@ -615,8 +864,32 @@ export async function applyPlugin(ctx, rawConfig = {}) {
   }
 }
 
+/** 注册用户命令。commands 服务同样可能晚于插件就绪；拿不到只记 warning。 */
+function registerUserCommands(ctx, status, deps, attempt = 0) {
+  try {
+    const service = typeof ctx?.get === 'function' ? ctx.get('commands') : undefined
+    if (service === undefined || service === null || typeof service.register !== 'function') {
+      if (attempt < 20) deps.retryLater(() => registerUserCommands(ctx, status, deps, attempt + 1))
+      else status.warnings.push('commands 服务 20s 内未就绪，/mem-trust、/mem-approve 等命令未注册')
+      return
+    }
+    for (const definition of deps.definitions) {
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => service.register(definition))
+      } else {
+        const dispose = service.register(definition)
+        if (typeof dispose === 'function') deps.onDispose(dispose)
+      }
+      status.commands.push(definition.name)
+    }
+    safeLog(ctx, 'info', `${name}: 已注册命令 ${status.commands.join(', ')}`)
+  } catch (error) {
+    status.warnings.push(`命令注册失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 /**
- * 注册五个记忆工具。DSH 的 tools 服务可能在 apply 之后才就绪，与 systemPrompt 同样做短轮询；
+ * 注册记忆工具。DSH 的 tools 服务可能在 apply 之后才就绪，与 systemPrompt 同样做短轮询；
  * 拿不到服务只记 warning——注入照常工作，不能因为工具起不来把插件整体判死。
  */
 function registerMemoryTools(ctx, status, deps, attempt = 0) {
@@ -631,12 +904,8 @@ function registerMemoryTools(ctx, status, deps, attempt = 0) {
             ? ctx.get('tools')
             : undefined
       if (service === undefined || service === null || typeof service.register !== 'function') {
-        if (attempt < 20) {
-          const timer = setTimeout(() => registerMemoryTools(ctx, status, deps, attempt + 1), 1000)
-          if (typeof timer?.unref === 'function') timer.unref()
-        } else {
-          status.warnings.push('tools 服务 20s 内未就绪，五个记忆工具未注册（注入不受影响）')
-        }
+        if (attempt < 20) deps.retryLater(() => registerMemoryTools(ctx, status, deps, attempt + 1))
+        else status.warnings.push('tools 服务 20s 内未就绪，记忆工具未注册（注入不受影响）')
         return
       }
       const registered = registerTools(service, deps, deps.prompts)
@@ -664,17 +933,13 @@ function registerHook(ctx, status, event, handler) {
   }
 }
 
-function registerGuideSection(ctx, status, prompts, attempt = 0) {
+function registerGuideSection(ctx, status, prompts, retryLater, attempt = 0) {
   const register = () => {
     try {
       const service = typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : ctx?.systemPrompt
       if (service === undefined || service === null || typeof service.section !== 'function') {
-        if (attempt < 20) {
-          const timer = setTimeout(() => registerGuideSection(ctx, status, prompts, attempt + 1), 1000)
-          if (typeof timer?.unref === 'function') timer.unref()
-        } else {
-          status.warnings.push('systemPrompt 20s 内未就绪，记忆手册未挂进 system prompt（工具不受影响）')
-        }
+        if (attempt < 20) retryLater(() => registerGuideSection(ctx, status, prompts, retryLater, attempt + 1))
+        else status.warnings.push('systemPrompt 20s 内未就绪，记忆手册未挂进 system prompt（工具不受影响）')
         return
       }
       service.section({ name: `${name}:guide`, order: 130, text: prompts.guide })

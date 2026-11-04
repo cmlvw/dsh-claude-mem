@@ -94,7 +94,14 @@ export function buildReinjection(deps, args) {
     const core = collectCore({ globalDb, workspaceDb, cfg, project, projectDetected, now })
     if (!core || typeof core.text !== 'string' || core.text === '') return null
     if (!Array.isArray(core.ids) || core.ids.length === 0) return null
-    return { text: core.text, ids: core.ids, chars: core.chars, dropped: core.dropped ?? 0 }
+    return {
+      text: core.text,
+      ids: core.ids,
+      bodyIds: core.bodyIds ?? core.ids,
+      indexIds: core.indexIds ?? [],
+      chars: core.chars,
+      dropped: core.dropped ?? 0,
+    }
   } catch {
     return null
   }

@@ -43,19 +43,35 @@ const GLOBAL_PROJECT = '全局'
 
 // ---------------------------------------------------------------- 关键词与文本
 
+/** 比较关键词时用的形式：全角转半角、不分大小写、忽略分隔符，让 Sub-Agent 和 subagent 算同一个词。 */
+export function normalizeKeyword(keyword) {
+  return String(keyword ?? '').normalize('NFKC').toLowerCase().replace(/[\s_\-./]+/g, '')
+}
+
+/** 去掉写法不同的重复词，保留第一种写法。 */
+function uniqueKeywords(keywords) {
+  const seen = new Set()
+  return keywords.filter((keyword) => {
+    const key = normalizeKeyword(keyword) || keyword
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 export function parseKeywords(value) {
-  if (Array.isArray(value)) return value.map(String).filter(Boolean)
+  if (Array.isArray(value)) return uniqueKeywords(value.map(String).filter(Boolean))
   if (typeof value !== 'string' || value.trim() === '') return []
   const text = value.trim()
   if (text.startsWith('[')) {
     try {
       const parsed = JSON.parse(text)
-      if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean)
+      if (Array.isArray(parsed)) return uniqueKeywords(parsed.map(String).filter(Boolean))
     } catch {
       // 退化为分隔符切分
     }
   }
-  return text.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean)
+  return uniqueKeywords(text.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean))
 }
 
 export function keywordString(value) {
@@ -74,7 +90,8 @@ export function bigrams(text) {
   const normalized = normalizeForCompare(text)
   const chars = Array.from(normalized)
   const result = new Set()
-  const latin = normalized.match(/[a-z0-9][a-z0-9_-]{1,}/g) ?? []
+  // 英文词要在去空白之前切，否则整段英文会粘成一个词，只有完全相同才算相似。
+  const latin = String(text ?? '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) ?? []
   for (const word of latin) result.add(word)
   const isCjk = (ch) => /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u.test(ch)
   for (let i = 0; i < chars.length - 1; i += 1) {
@@ -129,6 +146,10 @@ export function rowToEntry(row) {
     updated_at: row.updated_at,
     accessed_at: row.accessed_at ?? null,
     inject_count: row.inject_count ?? 0,
+    why: row.why ?? null,
+    how_to_apply: row.how_to_apply ?? null,
+    when_to_use: row.when_to_use ?? null,
+    corrected: row.corrected === 1 || row.corrected === true,
   }
 }
 
@@ -156,8 +177,9 @@ export function insertEntry(db, entry, now = Date.now()) {
   db.prepare(
     `INSERT INTO entries
       (id, level, scope, project, subcategory, goal, title, body, keywords, importance,
-       status, source_session, source_hash, created_at, updated_at, accessed_at, inject_count)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       status, source_session, source_hash, created_at, updated_at, accessed_at, inject_count,
+       why, how_to_apply, when_to_use, corrected)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
   ).run(
     id,
     entry.level,
@@ -175,6 +197,10 @@ export function insertEntry(db, entry, now = Date.now()) {
     entry.created_at ?? now,
     entry.updated_at ?? now,
     entry.accessed_at ?? null,
+    entry.why ?? null,
+    entry.how_to_apply ?? null,
+    entry.when_to_use ?? null,
+    entry.corrected ? 1 : 0,
   )
   return getEntry(db, id)
 }
@@ -198,7 +224,7 @@ export function resolveEntry(db, token) {
   if (text === '') return { entry: null, ambiguous: false }
   const exact = getEntry(db, text)
   if (exact !== null) return { entry: exact, ambiguous: false }
-  const rows = db.prepare(`SELECT * FROM entries WHERE id LIKE ? LIMIT 2`).all(`%${text}`)
+  const rows = db.prepare(`SELECT * FROM entries WHERE id LIKE ? ESCAPE '\\' LIMIT 2`).all(`%${escapeLike(text)}`)
   if (rows.length === 1) return { entry: rowToEntry(rows[0]), ambiguous: false }
   return { entry: null, ambiguous: rows.length > 1 }
 }
@@ -212,7 +238,7 @@ export function updateEntry(db, id, patch, now = Date.now()) {
     `UPDATE entries SET
        level = ?, scope = ?, project = ?, subcategory = ?, goal = ?, title = ?, body = ?,
        keywords = ?, importance = ?, status = ?, source_session = ?, source_hash = ?,
-       updated_at = ?, accessed_at = ?
+       updated_at = ?, accessed_at = ?, why = ?, how_to_apply = ?, when_to_use = ?, corrected = ?
      WHERE id = ?`,
   ).run(
     next.level,
@@ -229,9 +255,29 @@ export function updateEntry(db, id, patch, now = Date.now()) {
     next.source_hash ?? current.source_hash ?? hashEntry({ level: next.level, project: next.project, title, body: next.body }),
     now,
     next.accessed_at ?? current.accessed_at,
+    next.why ?? null,
+    next.how_to_apply ?? null,
+    next.when_to_use ?? null,
+    next.corrected ? 1 : 0,
     id,
   )
   return getEntry(db, id)
+}
+
+/** 否定词数量不同，说明两句话的立场可能相反（「必须」和「不必」只差一个字）。 */
+const NEGATION_RE = /不|别|勿|禁止|未|没有|\bnot\b|\bnever\b|\bno\b|n't\b/gi
+
+function negationCount(text) {
+  return (String(text ?? '').match(NEGATION_RE) ?? []).length
+}
+
+export function hasOppositePolarity(a, b) {
+  return negationCount(a) !== negationCount(b)
+}
+
+/** 关键词合并：新词在前，去重后截到上限，否则多次合并后会越来越长。 */
+function mergeKeywords(oldKeywords, newKeywords, max) {
+  return parseKeywords([...parseKeywords(newKeywords), ...parseKeywords(oldKeywords)]).slice(0, max)
 }
 
 /** 同层同项目的候选里找最相似的一条（写入去重与 dream 合并共用）。 */
@@ -255,23 +301,38 @@ export function findSimilar(db, entry, { threshold = 0.9, limit = 300 } = {}) {
 }
 
 /**
- * 写入入口：相似度 ≥ 阈值时合并旧条（更新正文/关键词/importance），否则新增。
- * @returns {{action:'inserted'|'merged', entry:object, score?:number}}
+ * 写入入口：相似度 ≥ 阈值时合并旧条，否则新增。
+ * - 新写入代表最新认知，正文总是用新的；旧正文通过 previousBody 交还给调用方，由它决定是否补回。
+ * - 立场可能相反的两条不合并：新增并通过 conflictsWith 指出旧条，避免静默覆盖或丢失。
+ * - 待确认的条目不并进已生效的条目，否则就绕过了确认。
+ * @returns {{action:'inserted'|'merged', entry:object, score?:number, previousBody?:string, conflictsWith?:string}}
  */
 export function upsertEntry(db, entry, options = {}, now = Date.now()) {
   const threshold = options.dedupThreshold ?? 0.9
+  if (entry.status === 'pending') {
+    return { action: 'inserted', entry: insertEntry(db, entry, now) }
+  }
   const similar = findSimilar(db, entry, { threshold })
   if (similar === null) {
     return { action: 'inserted', entry: insertEntry(db, entry, now) }
   }
+  if (hasOppositePolarity(entry.body, similar.row.body)) {
+    return { action: 'inserted', entry: insertEntry(db, entry, now), conflictsWith: similar.row.id, score: similar.score }
+  }
   const merged = {
-    body: String(entry.body ?? '').length >= similar.row.body.length ? entry.body : similar.row.body,
-    keywords: [...parseKeywords(similar.row.keywords), ...parseKeywords(entry.keywords)],
+    body: entry.body,
+    keywords: mergeKeywords(similar.row.keywords, entry.keywords, options.keywordMax ?? 13),
     importance: Math.max(similar.row.importance ?? 1, entry.importance ?? 1),
     status: 'active',
+    ...(entry.title ? { title: entry.title } : {}),
+    ...(entry.why ? { why: entry.why } : {}),
+    ...(entry.how_to_apply ? { how_to_apply: entry.how_to_apply } : {}),
+    ...(entry.when_to_use ? { when_to_use: entry.when_to_use } : {}),
+    ...(entry.corrected ? { corrected: true } : {}),
   }
+  const previousBody = similar.row.body === entry.body ? undefined : similar.row.body
   const updated = updateEntry(db, similar.row.id, merged, now)
-  return { action: 'merged', entry: updated, score: similar.score }
+  return { action: 'merged', entry: updated, score: similar.score, previousBody }
 }
 
 export function archiveEntry(db, id, status = 'archived', now = Date.now()) {
@@ -310,6 +371,14 @@ export function listGlobalCoreRows(db, { limitPerLevel = 12 } = {}) {
     )
   }
   return rows
+}
+
+/** 全局库里有效的核心层条目总数：用来告诉模型还有多少条没放进核心块。 */
+export function countGlobalCoreRows(db) {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM entries WHERE level IN ('soul','user','rules') AND status = 'active'`)
+    .get()
+  return row?.n ?? 0
 }
 
 /** 全局库里 project='全局' 的 fact/lesson（跨项目事实）。 */
@@ -525,15 +594,20 @@ export function searchEntries(db, query, { limit = 20, project, levels, now = Da
   // 不能直接比 bm25 原始分与 LIKE 分——两者量纲不同，会让「撞上一个通用词」压过真正相关的条目。
   for (const hit of found.values()) {
     const entry = hit.entry
-    const haystack = `${entry.title ?? ''}\n${(entry.keywords ?? []).join(' ')}\n${entry.body ?? ''}`.toLowerCase()
+    const haystack = `${entry.title ?? ''}\n${(entry.keywords ?? []).join(' ')}\n${entry.body ?? ''}\n${entry.when_to_use ?? ''}\n${entry.why ?? ''}`.toLowerCase()
+    const ownKeywords = new Set((entry.keywords ?? []).map((keyword) => String(keyword).toLowerCase()))
     let strength = 0
     for (const term of gateTerms) {
-      if (haystack.includes(term.toLowerCase())) strength += 2
+      const lower = term.toLowerCase()
+      // 命中条目自己标的关键词才是强信号；只在正文里碰巧出现的短词算弱信号。
+      if (ownKeywords.has(lower)) strength += 2
+      else if (haystack.includes(lower)) strength += Array.from(term).length >= 3 ? 1 : 0.4
     }
     for (const gram of signalGrams) {
       if (haystack.includes(gram.toLowerCase())) strength += 0.4
     }
     const fresh = Math.max(0, 1 - (now - (entry.updated_at ?? now)) / (30 * 24 * 3600 * 1000))
+    hit.strength = strength
     hit.score = strength + (entry.importance ?? 1) * 0.15 + fresh * 0.15
   }
 
@@ -543,9 +617,11 @@ export function searchEntries(db, query, { limit = 20, project, levels, now = Da
 // ---------------------------------------------------------------- 注入记录与会话
 
 export function markInjected(db, sessionId, entryIds, kind = 'hit', now = Date.now()) {
+  // 'index' 只代表标题露过面；之后注入正文时要升级这条记录，否则配额和去重都统计不到。
   const stmt = db.prepare(
     `INSERT INTO injections(session_id, entry_id, kind, at) VALUES(?, ?, ?, ?)
-     ON CONFLICT(session_id, entry_id) DO NOTHING`,
+     ON CONFLICT(session_id, entry_id) DO UPDATE SET kind = excluded.kind, at = excluded.at
+       WHERE injections.kind = 'index'`,
   )
   let count = 0
   for (const id of entryIds) {
@@ -558,13 +634,57 @@ export function markInjected(db, sessionId, entryIds, kind = 'hit', now = Date.n
   return count
 }
 
+/** 本会话已经给过正文的条目。只露过标题（kind='index'）的不算，它们仍可以命中。 */
 export function injectedIds(db, sessionId) {
   return new Set(
     db
-      .prepare(`SELECT entry_id FROM injections WHERE session_id = ?`)
+      .prepare(`SELECT entry_id FROM injections WHERE session_id = ? AND kind <> 'index'`)
       .all(sessionId)
       .map((row) => row.entry_id),
   )
+}
+
+/** 记录「这条记忆被用过」：整理时据此找出长期没用的条目。条目可能在全局库或工作区库，两边都更新。 */
+export function bumpInjectCount(dbs, entryIds, now = Date.now()) {
+  for (const db of dbs) {
+    if (!db) continue
+    const stmt = db.prepare(`UPDATE entries SET inject_count = COALESCE(inject_count, 0) + 1, accessed_at = ? WHERE id = ?`)
+    for (const id of entryIds) {
+      try {
+        stmt.run(now, id)
+      } catch {
+        // 使用统计失败不影响注入
+      }
+    }
+  }
+}
+
+/** 待用户确认的条目。 */
+export function listPendingEntries(db, { limit = 100 } = {}) {
+  if (!db) return []
+  return db
+    .prepare(`SELECT * FROM entries WHERE status = 'pending' ORDER BY created_at DESC LIMIT ?`)
+    .all(limit)
+    .map(rowToEntry)
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 清理运行数据（不碰记忆条目）：笔记含用户原话，injections 和 sessions 会无限增长。
+ * 记录要留够久，避免长期未关的会话被当成新会话重复注入。
+ */
+export function pruneOperationalData(db, { notesRetentionDays = 30, sessionRetentionDays = 90 } = {}, now = Date.now()) {
+  const sessionCutoff = now - sessionRetentionDays * DAY_MS
+  const notes = db.prepare(`DELETE FROM session_notes WHERE at < ?`).run(now - notesRetentionDays * DAY_MS).changes
+  const injections = db
+    .prepare(`DELETE FROM injections WHERE session_id IN (SELECT session_id FROM sessions WHERE last_seen_at < ?)`)
+    .run(sessionCutoff).changes
+  const sessions = db.prepare(`DELETE FROM sessions WHERE last_seen_at < ?`).run(sessionCutoff).changes
+  // 账本只有计数，留半年够看趋势了。
+  const statsCutoff = new Date(now - 180 * DAY_MS).toISOString().slice(0, 10)
+  db.prepare(`DELETE FROM recall_stats WHERE day < ?`).run(statsCutoff)
+  return { notes, injections, sessions }
 }
 
 /** 这个会话是否已经做过某一类注入（首轮/压缩重注入用来防重复）。 */
@@ -576,7 +696,7 @@ export function hasInjection(db, sessionId, kind) {
 /** 会话里做过「首轮 / 压缩重注入」中的任意一种（两者都给过核心块）。 */
 export function hasCoreInjection(db, sessionId) {
   const row = db
-    .prepare(`SELECT 1 AS x FROM injections WHERE session_id = ? AND kind IN ('initial', 'reinject') LIMIT 1`)
+    .prepare(`SELECT 1 AS x FROM injections WHERE session_id = ? AND kind IN ('initial', 'reinject', 'index') LIMIT 1`)
     .get(sessionId)
   return row !== undefined
 }
@@ -607,10 +727,23 @@ export function markReinjected(db, sessionId, entryIds, now = Date.now()) {
   return count
 }
 
-/** 只数「命中注入」的次数：首轮注入的条目不算命中额度，否则额度一开局就被吃光。 */
+/**
+ * 只数「命中注入」的轮数：首轮注入的条目不算命中额度，否则额度一开局就被吃光。
+ * 同一轮的条目由 markInjected 写入相同的 at，所以按不同 at 计数就是轮数。
+ */
 export function hitInjectionCount(db, sessionId) {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM injections WHERE session_id = ? AND kind = 'hit'`).get(sessionId)
+  const row = db
+    .prepare(`SELECT COUNT(DISTINCT at) AS n FROM injections WHERE session_id = ? AND kind = 'hit'`)
+    .get(sessionId)
   return row?.n ?? 0
+}
+
+/**
+ * 压缩后释放命中记录：那些正文已被摘要吃掉，应当能再次命中，配额也随之归零。
+ * 只动 kind='hit'，首轮与重注入的记录不受影响。
+ */
+export function releaseHitInjections(db, sessionId) {
+  return db.prepare(`DELETE FROM injections WHERE session_id = ? AND kind = 'hit'`).run(sessionId).changes
 }
 
 export function injectionStats(db, sessionId) {

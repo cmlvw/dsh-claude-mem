@@ -1,7 +1,7 @@
 /**
  * dsh-claude-mem · SQLite 骨架
  *
- * 只用 Node 内置 node:sqlite（Node ≥22.5，本机 24.22.1 / SQLite 3.53.4 实测可用）。
+ * 只用 Node 内置 node:sqlite（Node ≥22.13 无需实验参数，本机 24.22.1 / SQLite 3.53.4 实测可用）。
  * 表结构严格对齐 PLAN.md §4.2；两个库（全局/工作区）共用同一套 DDL。
  *
  * 实测约束（M0 发现，M3 召回要用）：
@@ -13,7 +13,15 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
+
+/** v2 新增的条目字段：记下「为什么」和「什么时候用」，只加列，旧版本插件仍能读这个库。 */
+const V2_ENTRY_COLUMNS = [
+  ['why', 'TEXT'],
+  ['how_to_apply', 'TEXT'],
+  ['when_to_use', 'TEXT'],
+  ['corrected', 'INTEGER DEFAULT 0'],
+]
 
 /** 核心表（§4.2）。 */
 const CORE_DDL = `
@@ -34,7 +42,11 @@ CREATE TABLE IF NOT EXISTS entries (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   accessed_at INTEGER,
-  inject_count INTEGER DEFAULT 0
+  inject_count INTEGER DEFAULT 0,
+  why TEXT,
+  how_to_apply TEXT,
+  when_to_use TEXT,
+  corrected INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_entries_level_status ON entries(level, status);
 CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(project, status);
@@ -92,6 +104,26 @@ CREATE TABLE IF NOT EXISTS session_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id, at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_notes_ws ON session_notes(workspace, at DESC);
+
+-- M6 语义召回：条目向量（BLOB = float32 小端，入库前已 L2 归一化）。
+-- 换模型或换维度时靠 model/dim 判断是否要重算；text_hash 变化才重新 embed。
+CREATE TABLE IF NOT EXISTS entry_vectors (
+  entry_id TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  vec BLOB NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- 召回账本：按天聚合的计数，不含任何用户原话或记忆内容。
+CREATE TABLE IF NOT EXISTS recall_stats (
+  day TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, outcome)
+);
 `
 
 /** FTS5（外部内容表 + 同步触发器）。失败则由调用方降级。 */
@@ -131,26 +163,28 @@ export function openMemoryDb(filePath, options = {}) {
 
     const db = new DatabaseSync(filePath)
     try {
-      db.exec(`PRAGMA journal_mode = WAL`)
+      // busy_timeout 必须最先设：切换 WAL 也要拿锁，多个会话同时启动时否则会立刻失败。
       db.exec(`PRAGMA busy_timeout = ${Number(busyTimeoutMs)}`)
+      db.exec(`PRAGMA journal_mode = WAL`)
       db.exec(`PRAGMA foreign_keys = ON`)
     } catch (error) {
       warnings.push(`PRAGMA 设置失败（不致命）：${error instanceof Error ? error.message : String(error)}`)
     }
 
     db.exec(CORE_DDL)
+    migrateSchema(db, filePath, warnings)
 
     let fts = false
     if (enableFts) {
       try {
         db.exec(FTS_DDL)
         fts = true
+        rebuildFtsIfStale(db, warnings)
       } catch (error) {
         warnings.push(`FTS5(trigram) 不可用，召回将退化为 LIKE：${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
-    stampSchema(db)
     return { ok: true, db, path: filePath, fts, warnings }
   } catch (error) {
     return {
@@ -162,13 +196,64 @@ export function openMemoryDb(filePath, options = {}) {
   }
 }
 
-/** 写 schema_version（首次建库写当前版本；未来升级在此分叉）。 */
-function stampSchema(db) {
-  const row = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()
-  if (row === undefined) {
-    db.prepare(`INSERT INTO meta(key, value) VALUES('schema_version', ?)`).run(String(SCHEMA_VERSION))
-    db.prepare(`INSERT INTO meta(key, value) VALUES('created_at', ?)`).run(String(Date.now()))
+function missingEntryColumns(db) {
+  const existing = new Set(db.prepare(`PRAGMA table_info(entries)`).all().map((column) => column.name))
+  return V2_ENTRY_COLUMNS.filter(([name]) => !existing.has(name))
+}
+
+/** 升级前留一份备份：VACUUM INTO 在 WAL 下也能得到一致的快照。已有备份就不重复做。 */
+function backupBeforeMigration(db, filePath, version, warnings) {
+  const entries = db.prepare(`SELECT COUNT(*) AS n FROM entries`).get().n
+  if (entries === 0) return
+  const target = `${filePath}.bak-schema${version}`
+  if (existsSync(target)) return
+  try {
+    db.prepare(`VACUUM INTO ?`).run(target)
+  } catch (error) {
+    warnings.push(`升级前备份失败（继续升级，只新增字段不改旧数据）：${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+/**
+ * 建库时写入版本；旧库按版本升级。
+ * 比当前版本更新的库不做任何改动，只给警告，避免旧插件破坏新库。
+ */
+function migrateSchema(db, filePath, warnings) {
+  const row = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()
+  const version = row === undefined ? null : Number(row.value)
+  if (version !== null && version > SCHEMA_VERSION) {
+    warnings.push(`记忆库版本 ${version} 高于插件支持的 ${SCHEMA_VERSION}（${filePath}），请升级插件。`)
+    return
+  }
+  if (version === SCHEMA_VERSION && missingEntryColumns(db).length === 0) return
+
+  if (version !== null) backupBeforeMigration(db, filePath, version, warnings)
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    // 拿到写锁后再查一次：另一个会话可能刚做完同样的升级。
+    for (const [name, type] of missingEntryColumns(db)) {
+      db.exec(`ALTER TABLE entries ADD COLUMN ${name} ${type}`)
+    }
+    writeMeta(db, 'schema_version', SCHEMA_VERSION)
+    if (version === null) writeMeta(db, 'created_at', Date.now())
+    db.exec('COMMIT')
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      // 回滚失败时保留原始错误
+    }
+    throw error
+  }
+}
+
+/** 后开启 FTS 或索引损坏时，旧条目不在索引里：行数对不上就重建。 */
+function rebuildFtsIfStale(db, warnings) {
+  const indexed = db.prepare(`SELECT COUNT(*) AS n FROM entries_fts_docsize`).get().n
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM entries`).get().n
+  if (indexed === total) return
+  db.exec(`INSERT INTO entries_fts(entries_fts) VALUES('rebuild')`)
+  warnings.push(`全文索引与条目数不一致（${indexed}/${total}），已重建。`)
 }
 
 export function readMeta(db, key) {
