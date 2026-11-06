@@ -51,7 +51,8 @@ function fakeCtx() {
 
 async function setup(cfg = {}) {
   const fake = fakeCtx()
-  const status = await apply(fake.ctx, { globalDbPath: globalPath, ...cfg })
+  // 下面直接造工作区库，不是插件创建的，要声明可信才会被读取。
+  const status = await apply(fake.ctx, { globalDbPath: globalPath, workspace: { trusted: [workspace] }, ...cfg })
   disposers.push(status.dispose)
 
   const global = openMemoryDb(globalPath).db

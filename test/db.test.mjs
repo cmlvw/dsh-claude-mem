@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { dbStats, newEntryId, openMemoryDb, readMeta, schemaVersion, writeMeta } from '../src/db.js'
+import { dbStats, newEntryId, openMemoryDb, readMeta, SCHEMA_VERSION, schemaVersion, writeMeta } from '../src/db.js'
 
 function tmpDir() {
   return mkdtempSync(join(tmpdir(), 'dsh-claude-mem-db-'))
@@ -51,7 +51,7 @@ test('建库：目录自动创建、schema 版本写入、可重复打开', () =
     const first = openMemoryDb(path)
     assert.equal(first.ok, true)
     assert.equal(first.fts, true)
-    assert.equal(schemaVersion(first.db), 1)
+    assert.equal(schemaVersion(first.db), SCHEMA_VERSION)
     first.db.close()
 
     const second = openMemoryDb(path)
@@ -123,7 +123,7 @@ test('meta 读写与 stats', () => {
     insertEntry(db)
     const stats = dbStats(db)
     assert.equal(stats.entries, 1)
-    assert.equal(stats.schemaVersion, 1)
+    assert.equal(stats.schemaVersion, SCHEMA_VERSION)
     assert.equal(stats.quarantine, 0)
     db.close()
   } finally {

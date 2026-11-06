@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, test } from 'node:test'
 
+import { SCHEMA_VERSION } from '../src/db.js'
 import { apply, Config, inject, name } from '../src/index.js'
 import { createSnapshotMessage, isOwnSnapshot } from '../src/message.js'
 
@@ -78,11 +79,10 @@ test('正常装配：ok、钩子齐全、guide 挂上、全局库建好', async 
   assert.equal(sections[0].name, 'dsh-claude-mem:guide')
   assert.ok(sections[0].text.length <= 600)
   assert.equal(status.db.fts, true)
-  assert.equal(status.db.stats.schemaVersion, 1)
-  assert.equal(status.tools.length, 5, 'M4 注册五个记忆工具')
+  assert.equal(status.db.stats.schemaVersion, SCHEMA_VERSION)
   assert.deepEqual(
     [...status.tools].sort(),
-    ['mem_project', 'mem_read', 'mem_remember', 'mem_search', 'mem_update'],
+    ['mem_project', 'mem_read', 'mem_remember', 'mem_review', 'mem_search', 'mem_update'],
   )
 })
 

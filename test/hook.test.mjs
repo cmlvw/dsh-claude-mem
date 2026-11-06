@@ -54,7 +54,8 @@ before(async () => {
   workspace = join(tmp, 'ws')
   const fake = fakeCtx()
   hooks = fake.map
-  status = await apply(fake.ctx, { globalDbPath: join(tmp, 'global.db') })
+  // 下面直接造工作区库，不是插件创建的，要声明可信才会被读取。
+  status = await apply(fake.ctx, { globalDbPath: join(tmp, 'global.db'), workspace: { trusted: [workspace] } })
 
   const global = openMemoryDb(join(tmp, 'global.db')).db
   insertEntry(global, {
@@ -113,7 +114,10 @@ test('首轮：核心块插在用户消息前，且记了 initial 注入', async
 
   const wsDb = openMemoryDb(join(workspace, '.dsh-claude-mem', 'memory.db')).db
   try {
-    assert.ok(injectedIds(wsDb, 's-first').size >= 2)
+    const rows = wsDb.prepare(`SELECT kind, COUNT(*) AS n FROM injections WHERE session_id = ? GROUP BY kind`).all('s-first')
+    assert.deepEqual(Object.fromEntries(rows.map((row) => [row.kind, row.n])), { index: 1, initial: 1 })
+    // 项目条目只露过标题，之后还要能命中正文，所以不算已注入。
+    assert.equal(injectedIds(wsDb, 's-first').size, 1)
   } finally {
     wsDb.close()
   }

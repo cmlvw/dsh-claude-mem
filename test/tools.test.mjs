@@ -227,7 +227,7 @@ test('summaryOf：超长截断带省略号，短文本原样', () => {
 
 // ---------------------------------------------------------------- 工具注册
 
-test('apply 注册五个工具，且能真实调用（fake ctx 走通）', async () => {
+test('apply 注册六个工具，且能真实调用（fake ctx 走通）', async () => {
   const workspace = join(tmpRoot, 'ws')
   const tools = []
   const ctx = {
@@ -247,7 +247,7 @@ test('apply 注册五个工具，且能真实调用（fake ctx 走通）', async
   }
   const status = await apply(ctx, { globalDbPath: join(tmpRoot, 'apply-global.db') })
   disposers.push(status.dispose)
-  assert.equal(tools.length, 5)
+  assert.equal(tools.length, 6)
 
   const exec = { agent: { session: { header: { cwd: workspace, id: 'session-x' } } } }
   const written = await tools.find((t) => t.name === 'mem_remember').execute(

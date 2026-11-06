@@ -101,19 +101,33 @@ test('核心块：准则/用户全文 + 项目索引行 + 短 id，顺序稳定'
 
 test('首轮未识别到项目时只兜底 1 行，不铺满索引（省字数决策 2026-10-28）', () => {
   const cfg = Config({})
-  // 不传 project：模拟 detectProject 返回 null，只兜底「最近项目」1 行
-  const fallback = collectCore({ globalDb, workspaceDb, cfg, now })
-  assert.equal(fallback.projectDetected, false)
-  assert.equal(fallback.project, 'projA', '兜底应取最近项目')
-  // 只 1 行索引：标题写「显示 1 条」，不该出现第 2 条短 id 行
-  assert.ok(fallback.text.includes('（显示 1 条）'), fallback.text)
-  const indexLines = fallback.text.split('\n').filter((line) => /^- [0-9a-z]{6} \[/.test(line))
-  assert.equal(indexLines.length, 1, '兜底只给 1 行索引')
-  // 明确识别到同一项目时应铺满上限（本夹具 projA 只有 2 条，兜底只给 1 条）
-  const detected = collectCore({ globalDb, workspaceDb, cfg, project: 'projA', projectDetected: true, now })
-  assert.equal(detected.projectDetected, true)
-  const detectedLines = detected.text.split('\n').filter((line) => /^- [0-9a-z]{6} \[/.test(line))
-  assert.ok(detectedLines.length > indexLines.length, '识别到项目时应比兜底多给索引行')
+  // 只有一个项目时不用等用户提名字，它就是当前项目；兜底只在多项目时发生。
+  assert.equal(collectCore({ globalDb, workspaceDb, cfg, now }).projectDetected, true)
+
+  const multiDb = openMemoryDb(join(tmp, 'multi.db')).db
+  try {
+    const project = (name, title, at) =>
+      insertEntry(multiDb, { level: 'project', scope: 'workspace', project: name, subcategory: 'todo', title, body: `${title}的详情。`, keywords: [title], importance: 2 }, at)
+    project('projB', '旧项目待办', now - 86400000)
+    project('projA', '新项目待办一', now)
+    project('projA', '新项目待办二', now)
+
+    // 不传 project：模拟 detectProject 返回 null，只兜底「最近项目」1 行
+    const fallback = collectCore({ globalDb, workspaceDb: multiDb, cfg, now })
+    assert.equal(fallback.projectDetected, false)
+    assert.equal(fallback.project, 'projA', '兜底应取最近项目')
+    // 只 1 行索引：标题写「显示 1 条」，不该出现第 2 条短 id 行
+    assert.ok(fallback.text.includes('（显示 1 条）'), fallback.text)
+    const indexLines = fallback.text.split('\n').filter((line) => /^- [0-9a-z]{6} \[/.test(line))
+    assert.equal(indexLines.length, 1, '兜底只给 1 行索引')
+    // 明确识别到同一项目时应铺满上限（本夹具 projA 只有 2 条，兜底只给 1 条）
+    const detected = collectCore({ globalDb, workspaceDb: multiDb, cfg, project: 'projA', projectDetected: true, now })
+    assert.equal(detected.projectDetected, true)
+    const detectedLines = detected.text.split('\n').filter((line) => /^- [0-9a-z]{6} \[/.test(line))
+    assert.ok(detectedLines.length > indexLines.length, '识别到项目时应比兜底多给索引行')
+  } finally {
+    multiDb.close()
+  }
 })
 
 test('预算裁剪：预算不够时丢行而不是超发，丢弃数可观测', () => {

@@ -208,6 +208,8 @@ test('注入记录：同一会话只记一次，可以回查', () => {
   // 命中额度只数 hit，不被 initial 吃光
   markInjected(db, 'session-y', ['h1', 'h2'], 'hit', now)
   markInjected(db, 'session-y', ['h1'], 'hit', now + 1)
+  assert.equal(hitInjectionCount(db, 'session-y'), 1, '额度按轮数算，重复条目不算新的一轮')
+  markInjected(db, 'session-y', ['h3'], 'hit', now + 2)
   assert.equal(hitInjectionCount(db, 'session-y'), 2)
   assert.equal(hitInjectionCount(db, 'session-x'), 0)
 })

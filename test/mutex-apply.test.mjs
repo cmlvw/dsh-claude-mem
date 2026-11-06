@@ -129,7 +129,7 @@ test('对手 disabled：正常装配（回滚后本插件必须真的能起来�
   assert.equal(status.mutex.conflict, false)
   assert.equal(status.mutex.reflected, true)
   assert.ok(hooks.has('agent/pre-step'), 'pre-step 要挂上')
-  assert.equal(tools.length, 5, '五个工具要注册')
+  assert.equal(tools.length, 6, '六个工具要注册')
 })
 
 test('mutexWithMeow=false：用户显式关闭检测时，对手在跑也装配', async () => {

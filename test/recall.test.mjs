@@ -71,7 +71,8 @@ test('Stage 0：信号词、项目名触发；短消息/纯应答/额度用尽�
   assert.equal(shouldRecall('随便说说'), false)
   assert.equal(shouldRecall('记忆机制改进 现在到哪了', { projectNames: ['记忆机制改进'] }), true)
   assert.equal(shouldRecall('上次说的备份要求是什么', { injectedCount: 8, maxHitsPerSession: 8 }), false)
-  assert.equal(shouldRecall('上次说的备份要求是什么', { enabled: false }), false)
+  // 关掉规则门是不再要求信号词，不是关掉召回。
+  assert.equal(shouldRecall('随便聊聊今天的天气', { enabled: false }), true)
   assert.equal(shouldRecall('随便说说随便说说随便说说', { minChars: 99 }), false)
 })
 
@@ -91,10 +92,11 @@ test('Stage 1：没有命中就返回空数组（零注入的前置条件）', (
   assert.deepEqual(recall({ globalDb: null, workspaceDb: db, text: '完全不存在的记忆词条 zzzz', topK: 20 }), [])
 })
 
-test('Stage 0 关键词信号：从库里 keywords 生成词表，2 字实体也能触发', () => {
+test('Stage 0 关键词信号：从库里 keywords 生成词表，长关键词的片段要凑够数才触发', () => {
   const terms = buildGateTerms(null, db)
   assert.equal(terms.has('语义精排'), true)
-  assert.equal(terms.has('精排'), true)
+  assert.equal(terms.has('精排'), false)
+  assert.equal(terms.partial.has('精排'), true)
   assert.equal(terms.has('全局库'), true)
   assert.deepEqual(matchGateTerms('精排默认开还是关', terms).includes('精排'), true)
   assert.equal(shouldRecall('精排默认开还是关', { gateTerms: terms }), true)
