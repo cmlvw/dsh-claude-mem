@@ -1,0 +1,82 @@
+[
+  {
+    "question_id": "mini_single",
+    "question_type": "single-session-user",
+    "question": "What brand of espresso machine did I buy?",
+    "answer": "Breville",
+    "question_date": "2023/06/10 (Sat) 09:00",
+    "haystack_session_ids": ["a_noise", "a_answer"],
+    "haystack_dates": ["2023/05/01 (Mon) 10:00", "2023/05/20 (Sat) 02:21"],
+    "haystack_sessions": [
+      [
+        { "role": "user", "content": "Can you suggest a stretching routine for runners?" },
+        { "role": "assistant", "content": "Try hamstring and calf stretches after each run." }
+      ],
+      [
+        { "role": "user", "content": "I just bought a Breville espresso machine for my kitchen.", "has_answer": true },
+        { "role": "assistant", "content": "Nice choice. Descale the machine every two months." }
+      ]
+    ],
+    "answer_session_ids": ["a_answer"]
+  },
+  {
+    "question_id": "mini_multi",
+    "question_type": "multi-session",
+    "question": "Which two cities did I visit for conferences?",
+    "answer": "Lisbon and Osaka",
+    "question_date": "2023/09/01 (Fri) 12:00",
+    "haystack_session_ids": ["b_first", "b_noise", "b_second"],
+    "haystack_dates": ["2023/03/02 (Thu) 08:00", "2023/04/02 (Sun) 08:00", "2023/08/02 (Wed) 08:00"],
+    "haystack_sessions": [
+      [
+        { "role": "user", "content": "The conferences trip to Lisbon went really well last week.", "has_answer": true },
+        { "role": "assistant", "content": "Glad the Lisbon trip worked out." }
+      ],
+      [
+        { "role": "user", "content": "How do I repot a fern?" },
+        { "role": "assistant", "content": "Use a slightly larger pot and fresh soil." }
+      ],
+      [
+        { "role": "user", "content": "Back from the conferences in Osaka, the talks were great.", "has_answer": true },
+        { "role": "assistant", "content": "Osaka sounds like a good venue." }
+      ]
+    ],
+    "answer_session_ids": ["b_first", "b_second"]
+  },
+  {
+    "question_id": "mini_update",
+    "question_type": "knowledge-update",
+    "question": "What is my current gym membership plan?",
+    "answer": "Annual plan",
+    "question_date": "2023/07/01 (Sat) 12:00",
+    "haystack_session_ids": ["c_old", "c_new"],
+    "haystack_dates": ["2023/01/05 (Thu) 08:00", "2023/06/05 (Mon) 08:00"],
+    "haystack_sessions": [
+      [
+        { "role": "user", "content": "My gym membership is the monthly plan for now.", "has_answer": true },
+        { "role": "assistant", "content": "Monthly gives you flexibility." }
+      ],
+      [
+        { "role": "user", "content": "I switched my gym membership to the annual plan.", "has_answer": true },
+        { "role": "assistant", "content": "The annual plan usually saves money." }
+      ]
+    ],
+    "answer_session_ids": ["c_new"]
+  },
+  {
+    "question_id": "mini_unknown_abs",
+    "question_type": "single-session-user",
+    "question": "What is the name of my pet parrot?",
+    "answer": "The information is not available.",
+    "question_date": "2023/07/01 (Sat) 12:00",
+    "haystack_session_ids": ["d_noise"],
+    "haystack_dates": ["2023/02/05 (Sun) 08:00"],
+    "haystack_sessions": [
+      [
+        { "role": "user", "content": "What is a good recipe for lentil soup?" },
+        { "role": "assistant", "content": "Simmer lentils with carrots and cumin." }
+      ]
+    ],
+    "answer_session_ids": []
+  }
+]

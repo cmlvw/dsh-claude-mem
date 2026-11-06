@@ -32,7 +32,9 @@
     "load-check": "node tools/load-check.mjs",
     "mutex-check": "node tools/check-default-disabled.mjs",
     "rehearsal": "node tools/rehearsal/run-rehearsal.mjs",
-    "admin": "node tools/mem-admin.mjs"
+    "admin": "node tools/mem-admin.mjs",
+    "bench": "node tools/bench-memory.mjs",
+    "bench:data": "node tools/bench/devmem/build.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
