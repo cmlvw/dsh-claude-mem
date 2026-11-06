@@ -504,6 +504,33 @@ function expandTerm(term) {
   return [...grams]
 }
 
+/** 命中不超过这么多条的词算稀有，全额计分。 */
+const RARE_TERM_RATIO = 0.01
+const RARE_TERM_FLOOR = 3
+
+/**
+ * 门控词的区分度折扣。项目名这类词命中一大片，单靠它说明不了这条和当前问题有关，
+ * 全额计分却足以越过 minStrength，无关条目就被注入了。
+ * @returns {(term:string) => number} 0–1，按命中条数反比下降
+ */
+function termRarity(db, scopeSql, params) {
+  const total = db.prepare(`SELECT count(*) AS n FROM entries e WHERE ${scopeSql}`).get(...params).n
+  const rareLimit = Math.max(RARE_TERM_FLOOR, Math.ceil(total * RARE_TERM_RATIO))
+  const count = db.prepare(
+    `SELECT count(*) AS n FROM entries e
+     WHERE ${scopeSql} AND (e.keywords LIKE ? ESCAPE '\\' OR e.body LIKE ? ESCAPE '\\')`,
+  )
+  const cache = new Map()
+  return (term) => {
+    if (!cache.has(term)) {
+      const pattern = `%${escapeLike(term)}%`
+      const matched = count.get(...params, pattern, pattern).n
+      cache.set(term, matched <= rareLimit ? 1 : rareLimit / matched)
+    }
+    return cache.get(term)
+  }
+}
+
 /**
  * 混合召回：FTS（≥3 字）优先，结果不足或用短词时用 LIKE 补齐。
  * 打分：FTS rank + importance + 时间衰减；LIKE 命中按 importance + 新旧排。
@@ -592,20 +619,24 @@ export function searchEntries(db, query, { limit = 20, project, levels, now = Da
 
   // 统一打分：命中信号词的强度为主，importance/新鲜度只做小幅加权。
   // 不能直接比 bm25 原始分与 LIKE 分——两者量纲不同，会让「撞上一个通用词」压过真正相关的条目。
+  const rarity = termRarity(db, scopeSql, params)
   for (const hit of found.values()) {
     const entry = hit.entry
     const haystack = `${entry.title ?? ''}\n${(entry.keywords ?? []).join(' ')}\n${entry.body ?? ''}\n${entry.when_to_use ?? ''}\n${entry.why ?? ''}`.toLowerCase()
     const ownKeywords = new Set((entry.keywords ?? []).map((keyword) => String(keyword).toLowerCase()))
-    let strength = 0
+    const signals = []
     for (const term of gateTerms) {
       const lower = term.toLowerCase()
       // 命中条目自己标的关键词才是强信号；只在正文里碰巧出现的短词算弱信号。
-      if (ownKeywords.has(lower)) strength += 2
-      else if (haystack.includes(lower)) strength += Array.from(term).length >= 3 ? 1 : 0.4
+      if (ownKeywords.has(lower)) signals.push({ points: 2, term })
+      else if (haystack.includes(lower)) signals.push({ points: Array.from(term).length >= 3 ? 1 : 0.4, term })
     }
     for (const gram of signalGrams) {
-      if (haystack.includes(gram.toLowerCase())) strength += 0.4
+      if (haystack.includes(gram.toLowerCase())) signals.push({ points: 0.4 })
     }
+    let strength = signals.reduce((sum, signal) => sum + signal.points, 0)
+    // 只有单靠一个门控词命中才看区分度：项目名加上别的词，已经不是撞词了。
+    if (signals.length === 1 && signals[0].term !== undefined) strength *= rarity(signals[0].term)
     const fresh = Math.max(0, 1 - (now - (entry.updated_at ?? now)) / (30 * 24 * 3600 * 1000))
     hit.strength = strength
     hit.score = strength + (entry.importance ?? 1) * 0.15 + fresh * 0.15

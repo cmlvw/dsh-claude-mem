@@ -200,13 +200,24 @@ export function gateDecision(text, options = {}) {
 /** 正文的词有多少已经出现在用户消息里。超过这个比例，再注入也不会带来新信息。 */
 const ECHO_COVERAGE = 0.7
 
+/** 在问而不是在说：这时问句和答案用词相同是常态，不能算复述。 */
+const ASKING_RE = /(几|多少|什么|啥|哪|谁|怎么|如何)/
+
+/** 数字和英文标识符。「7」「1.24」这类值进不了 bigrams，却往往就是答案本身。 */
+const concreteTokens = (text) =>
+  new Set(String(text ?? '').normalize('NFKC').toLowerCase().match(/[a-z0-9]+(?:[._:/-][a-z0-9]+)*/g) ?? [])
+
 /**
  * 用户是不是正在复述这条记忆（「你说过 X 对吧」）。这种时候相似度最高，注入却是多余的。
  * 只看正文：只提到标题的提问，正文对用户来说仍然是新信息。
+ * 正文里有用户没说过的具体值，就不是复述：「重试 7 次」和「重试几次」只差这一个字。
  */
 export function isEcho(text, entry) {
   const body = bigrams(entry?.body ?? '')
   if (body.size < 4) return false
+  if (ASKING_RE.test(String(text ?? ''))) return false
+  const said = concreteTokens(text)
+  for (const token of concreteTokens(entry?.body)) if (!said.has(token)) return false
   const message = bigrams(text)
   let covered = 0
   for (const gram of body) if (message.has(gram)) covered += 1

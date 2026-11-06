@@ -156,6 +156,50 @@ describe('门控与最低信号强度', () => {
     const hits = recall({ globalDb: null, workspaceDb: db, text, extraTerms, minStrength: 0.8 })
     assert.deepEqual(hits.map((hit) => hit.entry.id), [target.id])
   })
+
+  /** 库里 count 条都带同一个词，模拟项目名；gate 词表滤不掉，因为总量足够大。 */
+  const seedCommonWord = (count) => {
+    const db = openDb()
+    for (let i = 0; i < count; i += 1) {
+      insertEntry(db, { level: 'fact', project: 'p', body: `tidepool 第${i}条事实`, keywords: ['tidepool', `专属词语${i}`] })
+    }
+    for (let i = 0; i < 300; i += 1) {
+      insertEntry(db, { level: 'fact', project: 'p', body: `无关内容${i}`, keywords: [`其他词语${i}`] })
+    }
+    return db
+  }
+
+  it('只撞上高频词的条目过不了最低强度', () => {
+    const db = seedCommonWord(16)
+    const hits = recall({ globalDb: null, workspaceDb: db, text: 'tidepool 用的集群有几个节点', extraTerms: ['tidepool'], minStrength: 0.8 })
+    assert.deepEqual(hits, [])
+  })
+
+  it('高频词加上稀有词时能通过，并排在只撞高频词的条目前面', () => {
+    const db = seedCommonWord(16)
+    const target = insertEntry(db, { level: 'fact', project: 'p', body: 'tidepool 的周会在周四', keywords: ['tidepool', '周会'] })
+    const hits = recall({ globalDb: null, workspaceDb: db, text: 'tidepool 周会几点', extraTerms: ['tidepool', '周会'], minStrength: 0.8 })
+    assert.deepEqual(hits.map((hit) => hit.entry.id), [target.id])
+  })
+
+  it('高频词加上一个短词也算两个信号，不打折', () => {
+    const db = seedCommonWord(16)
+    const target = insertEntry(db, { level: 'fact', project: 'p', body: 'tidepool 的 CI 在内网', keywords: ['tidepool'] })
+    const hits = recall({ globalDb: null, workspaceDb: db, text: 'Which CI does tidepool use', extraTerms: ['tidepool'], minStrength: 0.8 })
+    assert.deepEqual(hits.map((hit) => hit.entry.id), [target.id])
+  })
+
+  it('条目不多的词不打折：小项目提一下名字仍能召回', () => {
+    const db = seedCommonWord(3)
+    const hits = recall({ globalDb: null, workspaceDb: db, text: 'tidepool 最近怎么样', extraTerms: ['tidepool'], minStrength: 0.8 })
+    assert.equal(hits.length, 3)
+  })
+
+  it('搜索词里的 LIKE 通配符按字面算', () => {
+    const db = seedCommonWord(16)
+    const hits = recall({ globalDb: null, workspaceDb: db, text: '100%_done 是什么', extraTerms: ['100%_done'], minStrength: 0 })
+    assert.ok(Array.isArray(hits))
+  })
 })
 
 describe('命中配额按轮计算', () => {

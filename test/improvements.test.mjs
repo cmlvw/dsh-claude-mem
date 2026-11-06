@@ -626,6 +626,29 @@ describe('复述抑制', () => {
     assert.equal(isEcho('用中文', { body: '用中文' }), false)
   })
 
+  it('用户在问时不算复述，哪怕用词几乎相同', () => {
+    assert.equal(isEcho('支付回调最多重试几次？', { body: '支付回调最多重试 7 次' }), false)
+    assert.equal(isEcho('周会在周几', { body: '周会在周四' }), false)
+  })
+
+  it('正文里有用户没说过的具体值就不是复述', () => {
+    assert.equal(isEcho('支付回调最多重试的次数', { body: '支付回调最多重试 7 次' }), false)
+    assert.equal(isEcho('项目现在用的 Go 版本', { body: '项目现在用的 Go 版本是 1.24' }), false)
+  })
+
+  it('具体值用户也说了，仍然算复述', () => {
+    assert.equal(isEcho('你说过支付回调最多重试 7 次对吧', { body: '支付回调最多重试 7 次' }), true)
+    assert.equal(isEcho('记得项目现在用的 Go 版本是 1.24', { body: '项目现在用的 Go 版本是 1.24' }), true)
+  })
+
+  it('流水线里问答案时，含答案的条目会被注入', async () => {
+    const env = pipelineEnv({ vector: { enabled: false } })
+    const answer = env.add(env.workspaceDb, { title: '回调重试', body: '支付回调最多重试 7 次', keywords: keywords('支付回调') })
+    const run = await env.run('支付回调最多重试几次？')
+    assert.deepEqual(run.echoes, [])
+    assert.deepEqual(run.picked.map((item) => item.entry.id), [answer.id])
+  })
+
   it('流水线里不注入复述的条目，也不占名额', async () => {
     const env = pipelineEnv({ vector: { enabled: false } })
     const echoed = env.add(env.workspaceDb, { title: '布隆过滤', body: '缓存穿透要用布隆过滤器拦截', keywords: keywords('缓存穿透') })
